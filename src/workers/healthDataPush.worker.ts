@@ -67,20 +67,42 @@ async function processHealthDataPush(job: Job<HealthDataPushJobData>): Promise<v
       ? await prisma.hospital.findFirst({ where: { id: tenantHospitalId } })
       : await prisma.hospital.findFirst({ where: { id: consent.patient.hospitalId || undefined } });
 
-    // Multi-tenant scope: load only care contexts owned by THIS tenant. The
-    // care-context row's `hipId` is the canonical owner — we never look up
-    // by patientId alone because that would let a request fulfilled as
-    // hospital A return care contexts authored at hospital B (the patient's
-    // sibling row). Local DB stays per-hospital; cross-hospital data flows
-    // ONLY through ABDM CM, never through the worker.
+    // Cross-hospital ABHA reconciliation.
+    // On a platform that acts as BOTH HIU and HIP, a consent raised at
+    // hospital A (HIU) references A's patient row, but the authorised care
+    // contexts were linked at hospital B (HIP) under B's OWN patient row for
+    // the SAME ABHA. Scoping by `consent.patientId` alone therefore returns
+    // zero rows — the classic `matched: 0` self-loop, even though ABDM routed
+    // this fulfil request to our hipId precisely because the ABHA linked
+    // contexts here. So resolve every local patient row that shares the
+    // consent patient's ABHA identity and match care contexts across them.
     //
-    // Note: the patientId scope is ALSO tenant-local — `consentPatientId`
-    // is the consent's patient row, which already lives at the tenant
-    // hospital (the consent was created there). This is just the safety
-    // belt to make accidental cross-tenant joins impossible.
+    // The `hipId = tenantHipId` filter below is retained, so the
+    // "never serve another hospital's data" invariant STILL holds: we only
+    // ever return care contexts this tenant owns. We're only broadening the
+    // patient-row match to sibling rows of the same national ABHA identifier.
+    const cp: any = consent.patient;
+    const abhaOr: any[] = [];
+    if (cp?.abhaNumber) abhaOr.push({ abhaNumber: cp.abhaNumber });
+    if (cp?.abhaAddress) abhaOr.push({ abhaAddress: cp.abhaAddress });
+    if (cp?.abhaId) abhaOr.push({ abhaId: cp.abhaId });
+    if (cp?.abhaRecord?.abhaNumber) abhaOr.push({ abhaRecord: { abhaNumber: cp.abhaRecord.abhaNumber } });
+    if (cp?.abhaRecord?.abhaAddress) abhaOr.push({ abhaRecord: { abhaAddress: cp.abhaRecord.abhaAddress } });
+    const abhaSiblingIds = abhaOr.length
+      ? (await prisma.patient.findMany({ where: { OR: abhaOr }, select: { id: true } })).map((p) => p.id)
+      : [];
+    const candidatePatientIds = Array.from(new Set([consentPatientId, ...abhaSiblingIds]));
+    if (candidatePatientIds.length > 1) {
+      logger.info('Worker: reconciled ABHA across patient rows for care-context lookup', {
+        transactionId,
+        consentPatientId,
+        candidatePatientCount: candidatePatientIds.length,
+      });
+    }
+
     const careContextsWithEnc = await prisma.careContext.findMany({
       where: {
-        patientId: consentPatientId,
+        patientId: { in: candidatePatientIds },
         ...(tenantHipId ? { hipId: tenantHipId } : {}),
       },
       include: {
@@ -130,7 +152,21 @@ async function processHealthDataPush(job: Job<HealthDataPushJobData>): Promise<v
     });
 
     if (dateValidContexts.length === 0) {
-      logger.warn('Worker: No encounters found in consent date range', { transactionId, from: dateRange?.from, to: dateRange?.to });
+      // Distinguish the failure modes: (a) zero care contexts matched the
+      // patient+hipId at all → linking/tenant problem; (b) contexts matched
+      // but their encounters fall outside the consent window → date-range
+      // problem; (c) contexts matched but have no encounter row → data model
+      // problem. The sample dates make a date-range mismatch obvious at a glance.
+      logger.warn('Worker: No encounters found in consent date range', {
+        transactionId,
+        from: dateRange?.from,
+        to: dateRange?.to,
+        matchedCareContexts: careContextsWithEnc.length,
+        careContextsWithoutEncounter: careContextsWithEnc.filter((cc) => !cc.encounter).length,
+        sampleEncounterDates: careContextsWithEnc
+          .slice(0, 5)
+          .map((cc) => cc.encounter?.visitDate || cc.encounter?.createdAt || null),
+      });
     }
 
     // Load vitals, investigations, immunizations and payments separately

@@ -1295,6 +1295,14 @@ export class HipService {
         consentAbdmId: request.hiRequest.consent.id,
         authorisedCareContextCount: authorisedCareContextRefs.length,
         hiTypes: consentHiTypes?.length ? consentHiTypes : '(no restriction)',
+        // Diagnostics for the cross-hospital self-loop: the consent's patient
+        // row vs the tenant we're fulfilling as. If matched:0 downstream, these
+        // reveal whether the consent patient row belongs to a different tenant
+        // than the hipId that owns the linked care contexts.
+        consentPatientId: consent.patientId,
+        tenantHipId: tenant.hipId,
+        tenantHospitalId: tenant.hospitalId,
+        effectiveDateRange,
       });
 
       await healthDataPushQueue.add(`push-${request.transactionId}`, jobData, {

@@ -184,11 +184,24 @@ export class HiuService {
         tenant,
       );
 
+      // Diagnostic: confirm the DH public key we hand ABDM is SPKI-DER (the
+      // form a real external HIP can parse). If this ever logs
+      // 'raw-uncompressed' again, the x509 encoding regressed and pulls from
+      // strict HIPs will silently fail with no data pushed.
+      const outboundReqKeyValue = ecdhKeyPair.x509PublicKey || ecdhKeyPair.publicKey;
+      const outboundReqKeyBytes = Buffer.from(outboundReqKeyValue, 'base64');
       logger.info('HIU: Health information request sent', {
         consentId: consent.consentId,
         cmRequestId,
+        abdmConsentId: consent.abdmConsentId,
         hiuId: tenant.hiuId,
         hospitalId: tenant.hospitalId,
+        dateRange: { from: dateRangeFrom, to: dateRangeTo },
+        outboundKeyEncoding: outboundReqKeyBytes[0] === 0x30 ? 'spki-der'
+          : (outboundReqKeyBytes.length === 65 && outboundReqKeyBytes[0] === 0x04) ? 'raw-uncompressed'
+          : 'unknown',
+        outboundKeyValueLength: outboundReqKeyValue.length,
+        outboundKeyBytesLength: outboundReqKeyBytes.length,
       });
       return { success: true, message: 'Health information request sent successfully' };
     } catch (error: any) {
@@ -393,10 +406,34 @@ export class HiuService {
         data.hiRequest?.consent?.id || data.consentId || data.consent?.id;
       const hipKeyMaterial = data.keyMaterial;
 
+      // Decode the HIP's DH public key up-front for diagnostics — its byte
+      // length/head lets us tell an SPKI (0x30…) from a raw point (0x04…) and
+      // is echoed on any decrypt failure below so we can tell a key-format
+      // problem from a session-key/nonce mismatch without re-running.
+      const hipPeerKeyB64: string | undefined = hipKeyMaterial?.dhPublicKey?.keyValue;
+      let hipPeerKeyBytes = 0;
+      let hipPeerKeyHead = '';
+      if (hipPeerKeyB64) {
+        try {
+          const b = EncryptionService.decodePeerKeyForDiagnostics(hipPeerKeyB64);
+          hipPeerKeyBytes = b.length;
+          hipPeerKeyHead = b.subarray(0, 8).toString('hex');
+        } catch { /* diagnostic only */ }
+      }
+
       logger.info('HIU: Receiving health information', {
         transactionId,
         consentId: abdmConsentId,
         entries: data.entries?.length || 0,
+        pageNumber: data.pageNumber ?? data.hiRequest?.pageNumber,
+        pageCount: data.pageCount ?? data.hiRequest?.pageCount,
+        hasKeyMaterial: !!hipKeyMaterial,
+        hipKeyValueLength: hipPeerKeyB64?.length || 0,
+        hipKeyBytesLength: hipPeerKeyBytes,
+        hipKeyHead: hipPeerKeyHead,
+        hipNonceLength: hipKeyMaterial?.nonce ? Buffer.from(hipKeyMaterial.nonce, 'base64').length : 0,
+        firstCareContextRef: data.entries?.[0]?.careContextReference,
+        bodyKeys: Object.keys(data || {}),
       });
       const decryptedEntries: Array<{
         data?: any;
@@ -446,6 +483,20 @@ export class HiuService {
         }
       }
 
+      if (!keyPairRecord) {
+        // Single, unambiguous signal that NO private key was found for this
+        // push — every entry below will be stored raw (undecryptable). This is
+        // the #1 reason records arrive but never appear: the on-request handler
+        // never mapped transactionId→keypair, or the keypair was already
+        // deleted by an earlier (final) page.
+        logger.warn('HIU: no keypair resolved for incoming data push — entries cannot be decrypted', {
+          transactionId,
+          consentId: abdmConsentId,
+          triedTransactionId: !!transactionId,
+          triedConsentId: !!abdmConsentId,
+        });
+      }
+
       for (const entry of data.entries || []) {
         // The careContextReference lives on the WIRE entry (alongside content/
         // checksum), NOT inside the encrypted FHIR bundle. Capture it here so
@@ -476,8 +527,23 @@ export class HiuService {
           );
           const parsed = JSON.parse(decryptedText);
           decryptedEntries.push({ data: parsed, decrypted: true, careContextReference });
+          logger.info('HIU: entry decrypted', {
+            transactionId,
+            careContextReference,
+            contentLength: entry.content?.length || 0,
+            plaintextLength: decryptedText.length,
+            resourceType: parsed?.resourceType,
+            fhirEntryCount: Array.isArray(parsed?.entry) ? parsed.entry.length : 0,
+          });
         } catch (decErr: any) {
-          logger.error('HIU: Failed to decrypt entry', { error: decErr.message });
+          logger.error('HIU: Failed to decrypt entry', {
+            transactionId,
+            careContextReference,
+            error: decErr.message,
+            contentLength: entry.content?.length || 0,
+            hipKeyBytesLength: hipPeerKeyBytes,
+            hipKeyHead: hipPeerKeyHead,
+          });
           decryptedEntries.push({ raw: entry, decrypted: false, error: decErr.message, careContextReference });
         }
       }
@@ -543,6 +609,17 @@ export class HiuService {
             orderBy: { createdAt: 'desc' },
             select: { patientId: true, id: true, status: true, requesterHospitalId: true, purgedAt: true },
           }));
+
+        logger.info('HIU: consent row resolved for persistence', {
+          transactionId,
+          lookupConsentId,
+          consentFound: !!consent,
+          consentRowId: consent?.id,
+          patientId: consent?.patientId,
+          status: consent?.status,
+          requesterHospitalId: consent?.requesterHospitalId,
+          purged: !!consent?.purgedAt,
+        });
 
         // Refuse to persist records that arrive after revoke/expire — this
         // closes the race window where ABDM is still pushing pages while the
@@ -613,7 +690,10 @@ export class HiuService {
         transactionId: data.transactionId,
         totalEntries: data.entries?.length || 0,
         decryptedCount: decryptedEntries.filter(e => e.decrypted).length,
+        failedCount: decryptedEntries.filter(e => !e.decrypted).length,
         persistedCount,
+        keypairResolved: !!keyPairRecord,
+        authorisationDropped,
       });
 
       // ── M3 compliance: notify CM that data was received ──────────────────
