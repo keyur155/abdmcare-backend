@@ -5,7 +5,7 @@ import { abdmConfig } from '../common/config/abdm';
 import { AbdmClient, resolveHipTenant } from '../common/utils/abdm-client';
 import EncryptionService from '../common/utils/encryption';
 import crypto from 'crypto';
-import { HealthDataPushJobData, createHealthDataPushWorker } from '../common/config/queue';
+import { HealthDataPushJobData, createHealthDataPushWorker, logHealthDataPushQueueCounts } from '../common/config/queue';
 import { deriveHiType, hiTypeToProfile, AbdmHiType } from '../modules/hip/discovery-helpers';
 
 const abdmClient = new AbdmClient();
@@ -391,18 +391,24 @@ async function processHealthDataPush(job: Job<HealthDataPushJobData>): Promise<v
     // the underlying uncompressed point, so this is purely an outbound
     // encoding swap. Our own `decodePeerPoint` already accepts both raw and
     // SPKI on inbound for forward-compatibility with HIUs that send raw.
-    const outboundKeyValue = ownKeyPair.x509PublicKey || ownKeyPair.publicKey;
-    const outboundKeyBytes = Buffer.from(outboundKeyValue, 'base64');
-    const outboundEncoding =
-      outboundKeyBytes.length === 65 && outboundKeyBytes[0] === 0x04 ? 'raw-uncompressed'
-      : outboundKeyBytes[0] === 0x30 ? 'spki-der'
+    // Per the M3/M2 data-push samples, dhPublicKey carries BOTH the raw point
+    // (keyValue) and its SPKI DER (x509PublicKey). The HIU imports our key via
+    // X509EncodedKeySpec (reads x509PublicKey); keeping keyValue as the raw
+    // point matches HIUs that read it directly. Never put SPKI in keyValue.
+    const outRawKeyValue = ownKeyPair.publicKey;
+    const outX509KeyValue = ownKeyPair.x509PublicKey || ownKeyPair.publicKey;
+    const outRawBytes = Buffer.from(outRawKeyValue, 'base64');
+    const outX509Bytes = Buffer.from(outX509KeyValue, 'base64');
+    const classifyKey = (b: Buffer) =>
+      b.length === 65 && b[0] === 0x04 ? 'raw-uncompressed'
+      : b[0] === 0x30 ? 'spki-der'
       : 'unknown';
     logger.info('Worker: outbound dhPublicKey wire format', {
       transactionId,
-      encoding: outboundEncoding,
-      keyValueLength: outboundKeyValue.length,
-      keyBytesLength: outboundKeyBytes.length,
-      keyHead: outboundKeyBytes.subarray(0, 8).toString('hex'),
+      keyValueEncoding: classifyKey(outRawBytes),
+      keyValueBytesLength: outRawBytes.length,
+      x509Encoding: classifyKey(outX509Bytes),
+      x509BytesLength: outX509Bytes.length,
     });
     const sessionKeyMaterial = {
       cryptoAlg: 'ECDH',
@@ -410,7 +416,8 @@ async function processHealthDataPush(job: Job<HealthDataPushJobData>): Promise<v
       dhPublicKey: {
         expiry: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
         parameters: 'Curve25519/32byte random key',
-        keyValue: outboundKeyValue,
+        keyValue: outRawKeyValue,
+        x509PublicKey: outX509KeyValue,
       },
       nonce: ownKeyPair.nonce,
     };
@@ -727,4 +734,9 @@ function buildBasicFHIRBundle(encounters: any[]): any {
 export function startHealthDataPushWorker(): void {
   createHealthDataPushWorker(processHealthDataPush);
   logger.info('Health data push worker started');
+  // Snapshot the queue depth at boot so a pre-existing backlog (jobs enqueued
+  // by a previous run that never drained) is immediately visible. A high
+  // `waiting`/`delayed` here means jobs are stuck, not that requests aren't
+  // arriving.
+  void logHealthDataPushQueueCounts('worker-boot');
 }

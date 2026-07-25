@@ -5,7 +5,7 @@ import { abdmConfig } from '../../common/config/abdm';
 import { AppError } from '../../common/middleware/errorHandler';
 import logger from '../../common/config/logger';
 import EncryptionService from '../../common/utils/encryption';
-import { healthDataPushQueue, HealthDataPushJobData } from '../../common/config/queue';
+import { healthDataPushQueue, HealthDataPushJobData, logHealthDataPushQueueCounts } from '../../common/config/queue';
 import redisClient from '../../common/config/redis';
 import { pickPatientByCascade, deriveHiType, AbdmHiType, careContextIdForEncounter } from './discovery-helpers';
 import { rethrowServiceError } from '../../common/utils/serviceErrors';
@@ -1310,6 +1310,11 @@ export class HipService {
       });
 
       logger.info('HIP: Health data push enqueued', { transactionId: request.transactionId });
+      // Immediately snapshot the queue depth. If `waiting` keeps climbing across
+      // successive enqueues while `active`/`completed` stay flat, the worker is
+      // not draining the queue — which is the difference between "request never
+      // arrived" and "request arrived but was never processed".
+      void logHealthDataPushQueueCounts(`post-enqueue:${request.transactionId}`);
       return { success: true, message: 'Health information request accepted, data push in progress' };
     } catch (error: any) {
       logger.error('HIP: Failed to process health information request', error);

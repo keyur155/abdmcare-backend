@@ -160,15 +160,18 @@ export class HiuService {
             dhPublicKey: {
               expiry: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
               parameters: 'Curve25519/32byte random key',
-              // ABDM Fidelius/BouncyCastle parses the DH key with
-              // X509EncodedKeySpec, which requires X.509 SPKI DER — a raw
-              // 65-byte uncompressed point (04||X||Y) makes a real external HIP
-              // throw "ABDM-9999: encoded key spec not recognized" and it never
-              // encrypts/pushes the data. Send the SPKI form (same fix as the
-              // HIP push worker). Our own inbound decoder accepts both forms, so
-              // self-loop still works. Salt/IV derivation uses the underlying
-              // point, so this is purely an outbound encoding swap.
-              keyValue: ecdhKeyPair.x509PublicKey || ecdhKeyPair.publicKey,
+              // Per the M3 "Health Information Request" success sample, the CM
+              // expects BOTH fields inside dhPublicKey:
+              //   • keyValue      → the RAW 65-byte uncompressed point (04||X||Y)
+              //   • x509PublicKey → the X.509 SPKI DER of the same point
+              // ABDM Fidelius/BouncyCastle imports the peer key via
+              // X509EncodedKeySpec and reads `x509PublicKey` when present; a HIP
+              // that instead reads `keyValue` expects the raw point there. So we
+              // send both in their canonical forms — never SPKI-in-keyValue,
+              // which mis-parses on strict HIPs that treat keyValue as raw.
+              // Salt/IV/session derivation uses the underlying point regardless.
+              keyValue: ecdhKeyPair.publicKey,
+              x509PublicKey: ecdhKeyPair.x509PublicKey || ecdhKeyPair.publicKey,
             },
             nonce: ecdhKeyPair.nonce,
           },
@@ -184,12 +187,15 @@ export class HiuService {
         tenant,
       );
 
-      // Diagnostic: confirm the DH public key we hand ABDM is SPKI-DER (the
-      // form a real external HIP can parse). If this ever logs
-      // 'raw-uncompressed' again, the x509 encoding regressed and pulls from
-      // strict HIPs will silently fail with no data pushed.
-      const outboundReqKeyValue = ecdhKeyPair.x509PublicKey || ecdhKeyPair.publicKey;
-      const outboundReqKeyBytes = Buffer.from(outboundReqKeyValue, 'base64');
+      // Diagnostic: confirm BOTH DH key fields go out in their canonical form —
+      // keyValue as the raw 65-byte point (0x04…) and x509PublicKey as SPKI DER
+      // (0x30…). Per the M3 sample the CM/HIP reads x509PublicKey to import our
+      // key; if keyValueEncoding ever shows 'spki-der' we regressed to sending
+      // SPKI-in-keyValue, which strict HIPs mis-parse.
+      const outReqRaw = Buffer.from(ecdhKeyPair.publicKey, 'base64');
+      const outReqSpki = Buffer.from(ecdhKeyPair.x509PublicKey || ecdhKeyPair.publicKey, 'base64');
+      const classify = (b: Buffer) => b[0] === 0x30 ? 'spki-der'
+        : (b.length === 65 && b[0] === 0x04) ? 'raw-uncompressed' : 'unknown';
       logger.info('HIU: Health information request sent', {
         consentId: consent.consentId,
         cmRequestId,
@@ -197,11 +203,10 @@ export class HiuService {
         hiuId: tenant.hiuId,
         hospitalId: tenant.hospitalId,
         dateRange: { from: dateRangeFrom, to: dateRangeTo },
-        outboundKeyEncoding: outboundReqKeyBytes[0] === 0x30 ? 'spki-der'
-          : (outboundReqKeyBytes.length === 65 && outboundReqKeyBytes[0] === 0x04) ? 'raw-uncompressed'
-          : 'unknown',
-        outboundKeyValueLength: outboundReqKeyValue.length,
-        outboundKeyBytesLength: outboundReqKeyBytes.length,
+        keyValueEncoding: classify(outReqRaw),
+        keyValueBytesLength: outReqRaw.length,
+        x509Encoding: classify(outReqSpki),
+        x509BytesLength: outReqSpki.length,
       });
       return { success: true, message: 'Health information request sent successfully' };
     } catch (error: any) {
@@ -822,6 +827,15 @@ export class HiuService {
       });
 
       if (!activeConsents.length) {
+        // DISPLAY STEP: nothing to show because no GRANTED/active consent scopes
+        // this hospital to any records for this patient. If a pull "succeeded"
+        // but this logs 0, the consent is REVOKED/EXPIRED or belongs to another
+        // tenant — the records exist but are gated out at read time.
+        logger.info('HIU: [display] no active consents — returning empty record set', {
+          patientId,
+          requesterHospitalId,
+          role: currentUser?.role,
+        });
         return { success: true, data: [] };
       }
 
@@ -849,6 +863,19 @@ export class HiuService {
             : {}),
         },
         orderBy: { receivedAt: 'desc' },
+      });
+
+      // DISPLAY STEP (final): what the UI actually receives. If activeConsents>0
+      // but returnedRecords=0, records were never persisted (decrypt/persist
+      // failed upstream) OR their hospitalId doesn't match this tenant. Compare
+      // against "HIU: Health information processed { persistedCount }".
+      logger.info('HIU: [display] returning external health records to UI', {
+        patientId,
+        requesterHospitalId,
+        activeConsentCount: activeConsents.length,
+        allowedConsentIdCount: allowedConsentIds.size,
+        returnedRecords: externalRecords.length,
+        recordTypes: Array.from(new Set(externalRecords.map((r: any) => r.recordType).filter(Boolean))).slice(0, 10),
       });
 
       return { success: true, data: externalRecords };

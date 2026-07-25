@@ -106,7 +106,52 @@ export function createHealthDataPushWorker(
     });
   });
 
+  // ── Lifecycle observability ────────────────────────────────────────────────
+  // Without these, a worker that cannot consume the queue fails SILENTLY: jobs
+  // pile up (enqueue logs appear) but no processing log ever does. These events
+  // pinpoint exactly why:
+  //   • 'ready'   → worker connected to Redis and is listening (should log once
+  //                 at boot; if it never appears, the worker never started)
+  //   • 'error'   → Redis/connection error (auth, wrong host, dropped socket)
+  //   • 'active'  → a job was actually picked up (fires just before the
+  //                 processor's own 'Worker: Processing' log)
+  //   • 'stalled' → a job was locked but its processor stopped renewing the lock
+  //                 (hung outbound push / event-loop block) — the classic cause
+  //                 of a queue that enqueues but never drains
+  worker.on('ready', () => {
+    logger.info('Health data push worker READY (connected to Redis, listening on "health-data-push")');
+  });
+  worker.on('error', (err) => {
+    logger.error('Health data push worker ERROR (queue will not drain)', { error: err?.message });
+  });
+  worker.on('active', (job) => {
+    logger.info('Health data push job ACTIVE (picked up by worker)', {
+      jobId: job?.id,
+      transactionId: job?.data?.transactionId,
+    });
+  });
+  worker.on('stalled', (jobId) => {
+    logger.warn('Health data push job STALLED (lock lost — processor hung or blocked)', { jobId });
+  });
+
   return worker;
+}
+
+/**
+ * Snapshot the health-data-push queue depth. Call at boot (and anywhere useful)
+ * to reveal a backlog: if `waiting`/`delayed` climb while `active` stays 0 and
+ * nothing completes, the worker is not consuming.
+ */
+export async function logHealthDataPushQueueCounts(context: string): Promise<void> {
+  try {
+    const counts = await healthDataPushQueue.getJobCounts(
+      'waiting', 'active', 'delayed', 'failed', 'completed', 'paused',
+    );
+    const isPaused = await healthDataPushQueue.isPaused();
+    logger.info('Health data push queue counts', { context, isPaused, ...counts });
+  } catch (err: any) {
+    logger.warn('Health data push queue counts unavailable', { context, error: err?.message });
+  }
 }
 
 export function createConsentExpiryWorker(
