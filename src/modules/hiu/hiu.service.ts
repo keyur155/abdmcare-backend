@@ -160,17 +160,16 @@ export class HiuService {
             dhPublicKey: {
               expiry: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
               parameters: 'Curve25519/32byte random key',
-              // Per the M3 "Health Information Request" success sample, the CM
-              // expects BOTH fields inside dhPublicKey:
-              //   • keyValue      → the RAW 65-byte uncompressed point (04||X||Y)
-              //   • x509PublicKey → the X.509 SPKI DER of the same point
-              // ABDM Fidelius/BouncyCastle imports the peer key via
-              // X509EncodedKeySpec and reads `x509PublicKey` when present; a HIP
-              // that instead reads `keyValue` expects the raw point there. So we
-              // send both in their canonical forms — never SPKI-in-keyValue,
-              // which mis-parses on strict HIPs that treat keyValue as raw.
-              // Salt/IV/session derivation uses the underlying point regardless.
-              keyValue: ecdhKeyPair.publicKey,
+              // ABDM Fidelius/BouncyCastle imports the peer DH key via
+              // `X509EncodedKeySpec(decode(keyValue))`, which REQUIRES the X.509
+              // SPKI DER, not the raw 65-byte point. Sending a raw point yields
+              // ABDM-9999 "encoded key spec not recognized … Extra data detected
+              // in stream" (observed live on the data-push side). So publish the
+              // SPKI form in BOTH keyValue and x509PublicKey. Salt/IV/session
+              // derivation uses the underlying point regardless, and our own
+              // inbound `decodePeerPoint` accepts raw+SPKI so the self-loop is
+              // unaffected.
+              keyValue: ecdhKeyPair.x509PublicKey || ecdhKeyPair.publicKey,
               x509PublicKey: ecdhKeyPair.x509PublicKey || ecdhKeyPair.publicKey,
             },
             nonce: ecdhKeyPair.nonce,

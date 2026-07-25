@@ -7,6 +7,7 @@ import { verifyAbdmCallback } from '../../common/middleware/verifyAbdmCallback';
 import { Request, Response } from 'express';
 import abdmClient from '../../common/utils/abdm-client';
 import { abdmConfig } from '../../common/config/abdm';
+import redisClient from '../../common/config/redis';
 import { purgeByAbdmConsentId } from '../hiu/consent-compliance';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -787,6 +788,25 @@ hipTokenV3Routes.post('/on-generate-token', verifyAbdmCallback, asyncHandler(asy
   });
 
   if (!linkToken) {
+    // ABDM abuse-guard backoff. ABDM-1027 ("You are blocked. Please try again
+    // after 24 hours") and ABDM-1092 ("Duplicate Link token request") mean
+    // re-firing generate-token for this ABHA will only extend the block. Set a
+    // Redis backoff key that addCareContexts checks BEFORE calling
+    // generate-token so repeated "Link" clicks stop hammering ABDM.
+    const errCode = String(payload?.error?.code || '');
+    try {
+      const digits = (abhaAddress || '').replace(/@.*$/, '').replace(/-/g, '')
+        || (abhaNumber || '').replace(/-/g, '');
+      if (digits) {
+        if (errCode.includes('ABDM-1027')) {
+          await redisClient.set(`link-token-blocked:${digits}`, 'ABDM-1027', { EX: 24 * 60 * 60 });
+        } else if (errCode.includes('ABDM-1092')) {
+          await redisClient.set(`link-token-blocked:${digits}`, 'ABDM-1092', { EX: 15 * 60 });
+        }
+      }
+    } catch {
+      // Redis unavailable — best effort; the 5-min request throttle still applies.
+    }
     // Surface the ABDM error verbatim — this is the authoritative reason
     // generate-token produced no link token (e.g. invalid ABHA address,
     // PHR not found). Without it the failure is invisible and linking

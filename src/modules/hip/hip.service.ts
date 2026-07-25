@@ -441,6 +441,37 @@ export class HipService {
       });
       return res;
     } catch (error: any) {
+      // "Duplicate HIP link request" (ABDM-9999) means ABDM ALREADY has these
+      // care contexts linked — re-sending link/carecontext for them is rejected.
+      // This happens when the local rows are stuck PENDING (e.g. a prior
+      // on_carecontext confirmation never landed) so every re-link loops on the
+      // same duplicate error and the status never flips. Reconcile local state
+      // to reality: mark the submitted contexts LINKED and return gracefully
+      // instead of throwing (which would otherwise clear the token and retry).
+      const abdmMsg = String(
+        error?.response?.data?.error?.message ||
+        error?.response?.data?.message ||
+        error?.message ||
+        '',
+      );
+      const isDuplicateLink = /duplicate/i.test(abdmMsg) && /link/i.test(abdmMsg);
+      if (isDuplicateLink) {
+        const submittedRefs = (params.patient || [])
+          .flatMap((p) => (p.careContexts || []).map((cc) => cc.referenceNumber))
+          .filter((r): r is string => !!r);
+        if (submittedRefs.length) {
+          await prisma.careContext.updateMany({
+            where: { careContextId: { in: submittedRefs } },
+            data: { linkStatus: 'LINKED', linkedAt: new Date(), linkError: null },
+          });
+        }
+        logger.info('HIP: [link] link/carecontext returned Duplicate — contexts already linked at ABDM; reconciled local status to LINKED', {
+          abhaNumber: maskAbha(abhaNumber),
+          abhaAddress: params.abhaAddress,
+          refs: submittedRefs,
+        });
+        return { alreadyLinked: true, careContexts: submittedRefs };
+      }
       logger.error('HIP: [link] ✗ link/carecontext failed', {
         abhaNumber: maskAbha(abhaNumber),
         abhaAddress: params.abhaAddress,
@@ -1539,6 +1570,32 @@ export class HipService {
           data: createdContexts,
           message: `${createdContexts.length} care context(s) registered — linking to ABDM with the existing active token (linkStatus will change to LINKED when ABDM confirms)`,
         };
+      }
+
+      // ABDM abuse-guard backoff. If a prior on-generate-token callback reported
+      // ABDM-1027 ("blocked, try after 24h") or ABDM-1092 ("Duplicate Link token
+      // request"), it set `link-token-blocked:<digits>`. While that key is live,
+      // firing generate-token again only EXTENDS the block — so skip it and tell
+      // the user exactly what happened instead of silently stalling in PENDING.
+      try {
+        const blocked = await redisClient.get(`link-token-blocked:${abhaNumber}`);
+        if (blocked) {
+          const msg = blocked === 'ABDM-1027'
+            ? 'ABDM has temporarily blocked new link-token requests for this ABHA (too many attempts). Please try again after 24 hours.'
+            : 'A link-token request for this ABHA is already being processed by ABDM. Please wait a few minutes, then link again.';
+          logger.warn('HIP: [link] generate-token skipped — ABDM abuse-guard backoff active', {
+            patientId,
+            abhaNumber: maskAbha(abhaNumber),
+            code: blocked,
+          });
+          return {
+            success: true,
+            data: createdContexts,
+            message: `${createdContexts.length} care context(s) saved locally. ${msg}`,
+          };
+        }
+      } catch {
+        // Redis unavailable — proceed (the short request throttle below still applies).
       }
 
       // Throttle: ABDM deduplicates link-token requests per ABHA and rejects a

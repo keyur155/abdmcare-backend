@@ -461,13 +461,16 @@ async function processHealthDataPush(job: Job<HealthDataPushJobData>): Promise<v
     // the underlying uncompressed point, so this is purely an outbound
     // encoding swap. Our own `decodePeerPoint` already accepts both raw and
     // SPKI on inbound for forward-compatibility with HIUs that send raw.
-    // Per the M3/M2 data-push samples, dhPublicKey carries BOTH the raw point
-    // (keyValue) and its SPKI DER (x509PublicKey). The HIU imports our key via
-    // X509EncodedKeySpec (reads x509PublicKey); keeping keyValue as the raw
-    // point matches HIUs that read it directly. Never put SPKI in keyValue.
-    const outRawKeyValue = ownKeyPair.publicKey;
+    //
+    // EMPIRICAL (live sandbox, ABDM-9999 "Could not read encrypted content …
+    // encoded key spec not recognized … Extra data detected in stream"): the
+    // ABDM patient-hiu app (Fidelius/BouncyCastle) reads **keyValue** and runs
+    // `X509EncodedKeySpec(decode(keyValue))` — so keyValue MUST be the SPKI DER,
+    // NOT the raw 65-byte point (raw → "Extra data detected in stream"). Publish
+    // the SPKI form in BOTH keyValue and x509PublicKey so any consumer that
+    // imports via X509EncodedKeySpec (the Fidelius reference behaviour) works.
     const outX509KeyValue = ownKeyPair.x509PublicKey || ownKeyPair.publicKey;
-    const outRawBytes = Buffer.from(outRawKeyValue, 'base64');
+    const outRawBytes = Buffer.from(ownKeyPair.publicKey, 'base64');
     const outX509Bytes = Buffer.from(outX509KeyValue, 'base64');
     const classifyKey = (b: Buffer) =>
       b.length === 65 && b[0] === 0x04 ? 'raw-uncompressed'
@@ -475,8 +478,9 @@ async function processHealthDataPush(job: Job<HealthDataPushJobData>): Promise<v
       : 'unknown';
     logger.info('Worker: outbound dhPublicKey wire format', {
       transactionId,
-      keyValueEncoding: classifyKey(outRawBytes),
-      keyValueBytesLength: outRawBytes.length,
+      keyValueEncoding: classifyKey(outX509Bytes),
+      keyValueBytesLength: outX509Bytes.length,
+      rawPointBytesLength: outRawBytes.length,
       x509Encoding: classifyKey(outX509Bytes),
       x509BytesLength: outX509Bytes.length,
     });
@@ -486,7 +490,7 @@ async function processHealthDataPush(job: Job<HealthDataPushJobData>): Promise<v
       dhPublicKey: {
         expiry: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
         parameters: 'Curve25519/32byte random key',
-        keyValue: outRawKeyValue,
+        keyValue: outX509KeyValue,
         x509PublicKey: outX509KeyValue,
       },
       nonce: ownKeyPair.nonce,
