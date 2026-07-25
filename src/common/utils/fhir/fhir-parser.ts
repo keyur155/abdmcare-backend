@@ -178,22 +178,98 @@ function extractAllergy(resource: any): ParsedFHIRData['allergies'][0] {
   };
 }
 
-function extractDocumentReference(resource: any): ParsedFHIRData['documents'][0] {
-  // FHIR DocumentReference always exposes its body via `content[].attachment`.
-  // We surface the first attachment (HIPs nearly always send one); UIs that
-  // want a multi-page view can fall back to the rawBundle.
-  const attachment = resource.content?.[0]?.attachment || {};
+type BinaryRecord = { contentType: string; data?: string };
+
+// Index every Binary resource in the (possibly nested) bundle by all the keys
+// an Attachment.url might use to reference it: `Binary/<id>`, the bare `<id>`,
+// and the entry.fullUrl (often `urn:uuid:<id>`). ABDM HIPs frequently send a
+// DocumentReference/DiagnosticReport whose attachment is a REFERENCE to a
+// separate Binary resource that actually holds the base64 PDF/DOC/image.
+function collectBinaries(
+  b: any,
+  index: Map<string, BinaryRecord>,
+  all: BinaryRecord[],
+): void {
+  if (!b || !Array.isArray(b.entry)) return;
+  for (const entry of b.entry) {
+    const resource = entry.resource || entry;
+    if (!resource?.resourceType) continue;
+    if (resource.resourceType === 'Bundle') {
+      collectBinaries(resource, index, all);
+      continue;
+    }
+    if (resource.resourceType === 'Binary') {
+      const rec: BinaryRecord = {
+        contentType: resource.contentType || 'application/octet-stream',
+        data: resource.data,
+      };
+      all.push(rec);
+      if (resource.id) {
+        index.set(`Binary/${resource.id}`, rec);
+        index.set(resource.id, rec);
+      }
+      if (entry.fullUrl) index.set(entry.fullUrl, rec);
+    }
+  }
+}
+
+// Turn a FHIR Attachment into a UI document, resolving Binary references to the
+// actual base64 payload when the attachment carries no inline `data`.
+function resolveAttachment(
+  attachment: any,
+  binaryIndex: Map<string, BinaryRecord>,
+): ParsedFHIRData['documents'][0] | null {
+  if (!attachment) return null;
+  let data: string | undefined = attachment.data;
+  let contentType: string = attachment.contentType || 'application/octet-stream';
+  let url: string | undefined = attachment.url;
+
+  if (!data && url) {
+    const bin =
+      binaryIndex.get(url) ||
+      binaryIndex.get(url.replace(/^urn:uuid:/, '')) ||
+      binaryIndex.get(url.replace(/^Binary\//, '')) ||
+      binaryIndex.get(url.replace(/^#/, ''));
+    if (bin) {
+      data = bin.data;
+      if (bin.contentType) contentType = bin.contentType;
+    }
+    // Keep the url only if it's an externally fetchable http(s) link. Internal
+    // references (Binary/…, urn:uuid:…, #contained) are meaningless to the UI
+    // once we've either inlined the data or failed to resolve it.
+    if (url && !/^https?:\/\//i.test(url)) url = undefined;
+  }
+
+  if (!data && !url) return null;
   return {
-    title: resource.description
-      || attachment.title
-      || extractCoding(resource.type).display
-      || 'Document',
-    contentType: attachment.contentType || 'application/octet-stream',
-    url: attachment.url,
-    data: attachment.data,
+    title: attachment.title || 'Document',
+    contentType,
+    url,
+    data,
     size: typeof attachment.size === 'number' ? attachment.size : undefined,
-    creation: attachment.creation || resource.date,
+    creation: attachment.creation,
   };
+}
+
+function extractDocumentReferences(
+  resource: any,
+  binaryIndex: Map<string, BinaryRecord>,
+): ParsedFHIRData['documents'] {
+  const baseTitle =
+    resource.description || extractCoding(resource.type).display || 'Document';
+  const out: ParsedFHIRData['documents'] = [];
+  const contents = Array.isArray(resource.content) ? resource.content : [];
+  for (const c of contents) {
+    const doc = resolveAttachment(c?.attachment, binaryIndex);
+    if (doc) {
+      out.push({
+        ...doc,
+        title: doc.title !== 'Document' ? doc.title : baseTitle,
+        creation: doc.creation || resource.date,
+      });
+    }
+  }
+  return out;
 }
 
 // FHIR Narrative.div is XHTML wrapped in <div xmlns="http://www.w3.org/1999/xhtml">.
@@ -220,6 +296,12 @@ export function parseFHIRBundle(bundle: any): ParsedFHIRData {
     allergies: [],
     documents: [],
   };
+
+  // Pre-pass: index every Binary resource so attachments that reference one
+  // (Binary/<id>, urn:uuid:<id>) can be resolved to their base64 payload.
+  const binaryIndex = new Map<string, BinaryRecord>();
+  const allBinaries: BinaryRecord[] = [];
+  collectBinaries(bundle, binaryIndex, allBinaries);
 
   // Walk entries recursively so nested Bundles (some HIPs wrap several
   // document Bundles inside a single collection Bundle) don't get silently
@@ -282,9 +364,24 @@ export function parseFHIRBundle(bundle: any): ParsedFHIRData {
         result.medications.push(extractMedication(resource));
         break;
 
-      case 'DiagnosticReport':
+      case 'DiagnosticReport': {
         result.reports.push(extractDiagnosticReport(resource));
+        // Lab/radiology PDFs ride in DiagnosticReport.presentedForm[] — surface
+        // each as a downloadable document so the actual report isn't lost.
+        const drTitle = extractCoding(resource.code).display || 'Diagnostic Report';
+        const forms = Array.isArray(resource.presentedForm) ? resource.presentedForm : [];
+        for (const att of forms) {
+          const doc = resolveAttachment(att, binaryIndex);
+          if (doc) {
+            result.documents.push({
+              ...doc,
+              title: doc.title !== 'Document' ? doc.title : `${drTitle} (attachment)`,
+              creation: doc.creation || resource.issued || resource.effectiveDateTime,
+            });
+          }
+        }
         break;
+      }
 
       case 'Procedure':
         result.procedures.push(extractProcedure(resource));
@@ -299,8 +396,21 @@ export function parseFHIRBundle(bundle: any): ParsedFHIRData {
         break;
 
       case 'DocumentReference':
-        result.documents.push(extractDocumentReference(resource));
+        result.documents.push(...extractDocumentReferences(resource, binaryIndex));
         break;
+
+      case 'Media': {
+        // Images (e.g. wound photos, scanned forms) arrive as Media.content.
+        const doc = resolveAttachment(resource.content, binaryIndex);
+        if (doc) {
+          result.documents.push({
+            ...doc,
+            title: doc.title !== 'Document' ? doc.title : (extractCoding(resource.type).display || 'Media'),
+            creation: doc.creation || resource.createdDateTime || resource.issued,
+          });
+        }
+        break;
+      }
 
       case 'Organization':
         if (!result.sourceHIP && resource.name) {
@@ -312,5 +422,21 @@ export function parseFHIRBundle(bundle: any): ParsedFHIRData {
   };
 
   walk(bundle);
+
+  // Surface any Binary that no DocumentReference/DiagnosticReport/Media pointed
+  // at (some HIPs send a bare Binary as the whole document). Dedupe against
+  // already-surfaced documents by a short data signature so we never show the
+  // same PDF twice.
+  const seen = new Set(
+    result.documents.map((d) => (d.data || d.url || '').slice(0, 64)).filter(Boolean),
+  );
+  for (const bin of allBinaries) {
+    if (!bin.data) continue;
+    const sig = bin.data.slice(0, 64);
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    result.documents.push({ title: 'Document', contentType: bin.contentType, data: bin.data });
+  }
+
   return result;
 }

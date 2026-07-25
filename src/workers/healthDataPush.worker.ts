@@ -1,4 +1,5 @@
 import { Job, UnrecoverableError } from 'bullmq';
+import fs from 'fs';
 import prisma from '../common/config/database';
 import logger from '../common/config/logger';
 import { abdmConfig } from '../common/config/abdm';
@@ -7,8 +8,54 @@ import EncryptionService from '../common/utils/encryption';
 import crypto from 'crypto';
 import { HealthDataPushJobData, createHealthDataPushWorker, logHealthDataPushQueueCounts } from '../common/config/queue';
 import { deriveHiType, hiTypeToProfile, AbdmHiType } from '../modules/hip/discovery-helpers';
+import { DocumentInput } from '../common/utils/fhir/resources/document-reference';
 
 const abdmClient = new AbdmClient();
+
+// Cap on how large a single document we inline as base64 into a bundle. ABDM
+// requires attachments to be inline base64 (no external URLs), but a huge PDF
+// would bloat the encrypted push and risk OOM — skip and log those instead.
+const MAX_INLINE_DOC_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Read locally-stored documents (Document.storageUrl is an on-disk path — see
+ * document.service.ts) and return them as base64 DocumentInput for the FHIR
+ * builder. Files missing on disk or over the size cap are skipped with a log.
+ */
+function readDocumentsAsBase64(docs: any[], transactionId: string): DocumentInput[] {
+  const out: DocumentInput[] = [];
+  for (const d of docs) {
+    try {
+      if (!d.storageUrl || !fs.existsSync(d.storageUrl)) {
+        logger.warn('Worker: document file missing on disk, skipping', {
+          transactionId, documentId: d.id, storageUrl: d.storageUrl,
+        });
+        continue;
+      }
+      const stat = fs.statSync(d.storageUrl);
+      if (stat.size > MAX_INLINE_DOC_BYTES) {
+        logger.warn('Worker: document too large to inline, skipping', {
+          transactionId, documentId: d.id, sizeBytes: stat.size,
+        });
+        continue;
+      }
+      const buf = fs.readFileSync(d.storageUrl);
+      out.push({
+        id: d.id,
+        title: d.fileName || String(d.type || 'Document'),
+        contentType: d.mimeType || 'application/pdf',
+        data: buf.toString('base64'),
+        size: buf.length,
+        creation: d.createdAt ? new Date(d.createdAt).toISOString() : undefined,
+      });
+    } catch (e: any) {
+      logger.warn('Worker: failed to read document, skipping', {
+        transactionId, documentId: d.id, error: e?.message,
+      });
+    }
+  }
+  return out;
+}
 
 /**
  * Sentinel thrown when a transfer cannot succeed regardless of retry — e.g.
@@ -183,7 +230,7 @@ async function processHealthDataPush(job: Job<HealthDataPushJobData>): Promise<v
         .filter(Boolean) as string[],
     ));
 
-    const [allVitals, allInvestigations, allImmunizations, allPayments] = await Promise.all([
+    const [allVitals, allInvestigations, allImmunizations, allPayments, allDocuments] = await Promise.all([
       dateValidEncIds.length > 0
         ? prisma.vitals.findMany({ where: { encounterId: { in: dateValidEncIds } } })
         : Promise.resolve([]),
@@ -201,6 +248,19 @@ async function processHealthDataPush(job: Job<HealthDataPushJobData>): Promise<v
                 ...(dateValidAdmissionIds.length > 0 ? [{ admissionId: { in: dateValidAdmissionIds } }] : []),
               ],
               status: { in: ['PAID', 'PARTIAL', 'REFUNDED', 'PENDING'] },
+            },
+          })
+        : Promise.resolve([]),
+      // Non-structured documents (uploaded/generated PDFs, scanned reports).
+      // Scoped to the in-range encounters + their IPD admission so we attach
+      // exactly the files that belong to each care context's encounter.
+      (dateValidEncIds.length > 0 || dateValidAdmissionIds.length > 0)
+        ? prisma.document.findMany({
+            where: {
+              OR: [
+                ...(dateValidEncIds.length > 0 ? [{ encounterId: { in: dateValidEncIds } }] : []),
+                ...(dateValidAdmissionIds.length > 0 ? [{ admissionId: { in: dateValidAdmissionIds } }] : []),
+              ],
             },
           })
         : Promise.resolve([]),
@@ -441,9 +501,18 @@ async function processHealthDataPush(job: Job<HealthDataPushJobData>): Promise<v
     // PHR app to silently drop the entry.
     const entries: Array<{ content: string; media: string; checksum: string; careContextReference: string; hiType: AbdmHiType }> = [];
 
+    let totalDocumentsAttached = 0;
     for (const { cc, hiType } of validContexts) {
       const enc = cc.encounter!;
       const profileOverride = hiTypeToProfile(hiType);
+      // Non-structured files (PDF/DOC/image) belonging to THIS encounter (or its
+      // IPD admission). Read from disk and inlined as base64 DocumentReferences
+      // so the bundle carries both structured FHIR AND the original documents.
+      const encDocs = allDocuments.filter((d: any) =>
+        d.encounterId === enc.id || (enc.admissionId && d.admissionId === enc.admissionId),
+      );
+      const documentInputs = encDocs.length ? readDocumentsAsBase64(encDocs, transactionId) : [];
+      totalDocumentsAttached += documentInputs.length;
       try {
         const fhirBundle = buildFHIRBundle({
           patient: consent.patient,
@@ -453,6 +522,7 @@ async function processHealthDataPush(job: Job<HealthDataPushJobData>): Promise<v
           vitals: vitalsByEnc.get(enc.id) || [],
           encounterPrescriptions: enc.prescriptions || [],
           investigations: investigationsByEnc.get(enc.id) || [],
+          documents: documentInputs,
           immunizations: (immunizationsByEnc.get(enc.id) || []).map((im: any) => ({
             id: im.id,
             vaccineName: im.vaccineName,
@@ -535,6 +605,7 @@ async function processHealthDataPush(job: Job<HealthDataPushJobData>): Promise<v
     logger.info('Worker: Built FHIR bundles per consented hiType', {
       transactionId,
       bundleCount: entries.length,
+      documentsAttached: totalDocumentsAttached,
       hiTypeBreakdown: entries.reduce((acc, e) => {
         acc[e.hiType] = (acc[e.hiType] || 0) + 1;
         return acc;
@@ -665,36 +736,55 @@ async function processHealthDataPush(job: Job<HealthDataPushJobData>): Promise<v
     const isLastAttempt = (job.attemptsMade + 1) >= (job.opts?.attempts || 1);
     const shouldNotify = isUnrecoverable || isLastAttempt;
     if (shouldNotify) {
-      try {
-        const failTenant = tenantHospitalId
-          ? await resolveHipTenant(tenantHospitalId).catch(() => null)
-          : null;
-        const failHipId = failTenant?.hipId || tenantHipId || abdmConfig.hip.id;
-        await abdmClient.post(
-          abdmConfig.endpoints.hip.dataFlowNotify,
-          {
-            notification: {
-              consentId: consentAbdmId,
-              transactionId,
-              doneAt: new Date().toISOString(),
-              notifier: { type: 'HIP', id: failHipId },
-              statusNotification: {
-                sessionStatus: 'FAILED',
-                hipId: failHipId,
-                // ABDM requires a non-empty statusResponses array even on failure.
-                statusResponses: (careContextRefs.length > 0 ? careContextRefs : ['']).map((ref) => ({
-                  careContextReference: ref,
-                  hiStatus: 'FAILED',
-                  description,
-                })),
+      // Resolve the careContextReferences to report as ERRORED. Prefer the ones
+      // we were about to ship; fall back to the artefact-authorised refs. ABDM
+      // rejects a statusResponses entry whose careContextReference is empty
+      // (ABDM-7727 / 400), so a "no data" failure (stale/empty consent) has
+      // NOTHING valid to report — sending careContextReference:'' just spams the
+      // CM with 400s. In that case skip the notify (the HIU side already skips
+      // for the same reason); the CM ages the transfer out on its own.
+      const failRefs = careContextRefs.length > 0
+        ? careContextRefs
+        : (authorisedCareContextRefs && authorisedCareContextRefs.length > 0
+            ? authorisedCareContextRefs
+            : []);
+      if (failRefs.length === 0) {
+        logger.warn('Worker: skipping FAILED notification — no careContextReference to report (empty consent scope; would 400)', {
+          transactionId,
+          consentAbdmId,
+          reason: description,
+        });
+      } else {
+        try {
+          const failTenant = tenantHospitalId
+            ? await resolveHipTenant(tenantHospitalId).catch(() => null)
+            : null;
+          const failHipId = failTenant?.hipId || tenantHipId || abdmConfig.hip.id;
+          await abdmClient.post(
+            abdmConfig.endpoints.hip.dataFlowNotify,
+            {
+              notification: {
+                consentId: consentAbdmId,
+                transactionId,
+                doneAt: new Date().toISOString(),
+                notifier: { type: 'HIP', id: failHipId },
+                statusNotification: {
+                  sessionStatus: 'FAILED',
+                  hipId: failHipId,
+                  statusResponses: failRefs.map((ref) => ({
+                    careContextReference: ref,
+                    hiStatus: 'FAILED',
+                    description,
+                  })),
+                },
               },
             },
-          },
-          { 'X-HIP-ID': failHipId },
-          failTenant,
-        );
-      } catch (notifyErr: any) {
-        logger.error('Worker: Failed to send FAILED notification to ABDM', { error: notifyErr.message });
+            { 'X-HIP-ID': failHipId },
+            failTenant,
+          );
+        } catch (notifyErr: any) {
+          logger.error('Worker: Failed to send FAILED notification to ABDM', { error: notifyErr.message });
+        }
       }
     } else {
       logger.info('Worker: Skipping FAILED notification — will retry', {

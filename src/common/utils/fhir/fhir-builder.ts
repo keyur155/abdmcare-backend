@@ -1,4 +1,6 @@
 import { BundleEntry, FHIRReference, urnUUID } from './coding-tables';
+import { SECTION_CODES } from './resources/composition';
+import { buildDocumentReferences, DocumentInput } from './resources/document-reference';
 import { buildPatient } from './resources/patient';
 import { buildPractitioner } from './resources/practitioner';
 import { buildOrganization } from './resources/organization';
@@ -124,6 +126,14 @@ export interface FHIRBundleInput {
    * them as FHIR Invoice resources.
    */
   payments?: InvoiceInput[];
+  /**
+   * Non-structured documents (PDF/DOC/image/etc.) to attach to the bundle.
+   * Each carries base64-encoded file content. Emitted as FHIR
+   * DocumentReference resources and referenced from a "Document Reference"
+   * Composition section, so a bundle can carry BOTH structured FHIR data and
+   * the original scanned/generated files — per the ABDM attachment model.
+   */
+  documents?: DocumentInput[];
   /** Force a specific profile instead of auto-detecting from encounter type */
   profileOverride?: ProfileName;
 }
@@ -343,24 +353,64 @@ export function generateFHIRBundle(input: FHIRBundleInput) {
 
   const profile = selectProfile(input);
 
+  let bundle;
   switch (profile) {
     case 'OPConsultRecord':
-      return buildOPConsultBundle(commonPayload);
+      bundle = buildOPConsultBundle(commonPayload); break;
     case 'DischargeSummaryRecord':
-      return buildDischargeSummaryBundle(commonPayload);
+      bundle = buildDischargeSummaryBundle(commonPayload); break;
     case 'PrescriptionRecord':
-      return buildPrescriptionBundle(commonPayload);
+      bundle = buildPrescriptionBundle(commonPayload); break;
     case 'DiagnosticReportRecord':
-      return buildDiagnosticReportBundle(commonPayload);
+      bundle = buildDiagnosticReportBundle(commonPayload); break;
     case 'HealthDocumentRecord':
-      return buildHealthDocumentBundle(commonPayload);
+      bundle = buildHealthDocumentBundle(commonPayload); break;
     case 'ImmunizationRecord':
-      return buildImmunizationRecordBundle(commonPayload);
+      bundle = buildImmunizationRecordBundle(commonPayload); break;
     case 'WellnessRecord':
-      return buildWellnessRecordBundle(commonPayload);
+      bundle = buildWellnessRecordBundle(commonPayload); break;
     case 'InvoiceRecord':
-      return buildInvoiceRecordBundle(commonPayload);
+      bundle = buildInvoiceRecordBundle(commonPayload); break;
   }
+
+  // ── Attach non-structured documents (PDF/DOC/image) uniformly ──────────────
+  // ABDM lists DocumentReference as a valid entry for EVERY HI type, so rather
+  // than special-casing each profile we build the DocumentReference resources
+  // once and (a) append them to the bundle's entry[] and (b) add a "Document
+  // Reference" section to the Composition so every entry stays referenced from
+  // the Composition (required for a `type: "document"` Bundle). This lets a
+  // single bundle carry BOTH structured data AND the original files.
+  if (bundle && input.documents && input.documents.length > 0) {
+    const documentResults = buildDocumentReferences(
+      input.documents,
+      patientRef,
+      practitionerRef,
+      encounterRef,
+    );
+    if (documentResults.length > 0) {
+      bundle.entry.push(
+        ...documentResults.map((d) => ({ fullUrl: urnUUID(d.uuid), resource: d.resource })),
+      );
+      const composition: any = bundle.entry[0]?.resource;
+      if (composition && composition.resourceType === 'Composition') {
+        composition.section = composition.section || [];
+        const listHtml = `<ul>${input.documents
+          .map((d) => `<li>${(d.title || 'Document').replace(/[<>&"]/g, '')} (${d.contentType})</li>`)
+          .join('')}</ul>`;
+        composition.section.push({
+          title: 'Document Reference',
+          code: SECTION_CODES.documentReference,
+          entry: documentResults.map((d) => ({ reference: urnUUID(d.uuid) })),
+          text: {
+            status: 'generated',
+            div: `<div xmlns="http://www.w3.org/1999/xhtml">${listHtml}</div>`,
+          },
+        });
+      }
+    }
+  }
+
+  return bundle;
 }
 
 export { generateFHIRBundle as buildFHIRBundle };
