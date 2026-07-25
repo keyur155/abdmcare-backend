@@ -221,14 +221,22 @@ export function parseFHIRBundle(bundle: any): ParsedFHIRData {
     documents: [],
   };
 
-  if (!bundle || !Array.isArray(bundle.entry)) return result;
+  // Walk entries recursively so nested Bundles (some HIPs wrap several
+  // document Bundles inside a single collection Bundle) don't get silently
+  // dropped — every leaf resource is merged into the same `result`.
+  const walk = (b: any): void => {
+    if (!b || !Array.isArray(b.entry)) return;
 
-  for (const entry of bundle.entry) {
-    const resource = entry.resource || entry;
-    if (!resource?.resourceType) continue;
+    for (const entry of b.entry) {
+      const resource = entry.resource || entry;
+      if (!resource?.resourceType) continue;
 
-    switch (resource.resourceType) {
-      case 'Composition': {
+      switch (resource.resourceType) {
+        case 'Bundle':
+          walk(resource);
+          break;
+
+        case 'Composition': {
         result.compositionTitle = resource.title;
         result.compositionDate = resource.date;
         if (resource.custodian?.display) {
@@ -299,8 +307,10 @@ export function parseFHIRBundle(bundle: any): ParsedFHIRData {
           result.sourceHIP = resource.name;
         }
         break;
+      }
     }
-  }
+  };
 
+  walk(bundle);
   return result;
 }

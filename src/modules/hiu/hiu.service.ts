@@ -160,7 +160,15 @@ export class HiuService {
             dhPublicKey: {
               expiry: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
               parameters: 'Curve25519/32byte random key',
-              keyValue: ecdhKeyPair.publicKey,
+              // ABDM Fidelius/BouncyCastle parses the DH key with
+              // X509EncodedKeySpec, which requires X.509 SPKI DER — a raw
+              // 65-byte uncompressed point (04||X||Y) makes a real external HIP
+              // throw "ABDM-9999: encoded key spec not recognized" and it never
+              // encrypts/pushes the data. Send the SPKI form (same fix as the
+              // HIP push worker). Our own inbound decoder accepts both forms, so
+              // self-loop still works. Salt/IV derivation uses the underlying
+              // point, so this is purely an outbound encoding swap.
+              keyValue: ecdhKeyPair.x509PublicKey || ecdhKeyPair.publicKey,
             },
             nonce: ecdhKeyPair.nonce,
           },
@@ -637,7 +645,11 @@ export class HiuService {
             };
           });
         const allOk = statusResponses.length > 0 && statusResponses.every(s => s.hiStatus === 'OK');
-        const sessionStatus = allOk ? 'TRANSFERRED' : 'FAILED';
+        // M3 data-flow notify: the HIU (data RECEIVER) reports RECEIVED on
+        // success — 'TRANSFERRED' is the HIP (sender) status. Sending the wrong
+        // token leaves the CM's data_flow_request stuck instead of complete.
+        // (See Milestone 3 "Data Flow Notification" success sample.)
+        const sessionStatus = allOk ? 'RECEIVED' : 'FAILED';
         // Route the notify under the consent's requester tenant so the CM
         // sees the same hiuId we used on /cm/request. consentRequesterHospitalId
         // is captured above; if it's null (legacy data) we fall back to
