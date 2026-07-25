@@ -802,11 +802,19 @@ hipTokenV3Routes.post('/on-generate-token', verifyAbdmCallback, asyncHandler(asy
     return;
   }
 
-  // Find patient by abhaAddress / abhaNumber
+  // Find patient by abhaAddress / abhaNumber.
   const abhaDigits = (abhaAddress || '').replace(/@.*$/, '').replace(/-/g, '')
     || (abhaNumber || '').replace(/-/g, '');
 
-  const patient = await prisma.patient.findFirst({
+  // CRITICAL: resolve ALL local patient rows that share this ABHA, not just the
+  // first. ABDM's on-generate-token callback only carries the ABHA (never our
+  // local patientId), so when the same person exists as duplicate patient rows
+  // a `findFirst` can land on a row that has NO pending care contexts — the
+  // link token then gets stored against the wrong row and the real PENDING
+  // contexts (on the row that actually initiated linking) are stranded in
+  // PENDING forever. Operating across every matching row makes linking
+  // deterministic regardless of duplicates.
+  const patients = await prisma.patient.findMany({
     where: {
       OR: [
         ...(abhaAddress ? [{ abhaAddress }] : []),
@@ -821,70 +829,105 @@ hipTokenV3Routes.post('/on-generate-token', verifyAbdmCallback, asyncHandler(asy
     include: { abhaRecord: true },
   });
 
-  if (!patient) {
+  if (!patients.length) {
     logger.warn('on-generate-token: patient not found', { abhaAddress, abhaNumber });
     res.status(202).json({ message: 'Patient not found' });
     return;
   }
 
-  // Store linkToken on all PENDING care contexts for this patient
-  await prisma.careContext.updateMany({
-    where: { patientId: patient.id, linkStatus: 'PENDING' },
+  const patientIds = patients.map((p) => p.id);
+
+  // Store linkToken on every PENDING care context across ALL matching rows.
+  const stored = await prisma.careContext.updateMany({
+    where: { patientId: { in: patientIds }, linkStatus: 'PENDING' },
     data: { linkToken },
   });
-  logger.info('on-generate-token: stored link token on care contexts', { patientId: patient.id });
+  logger.info('on-generate-token: stored link token on care contexts', {
+    matchedPatientIds: patientIds,
+    updatedContexts: stored.count,
+  });
 
-  // Automatically trigger hipInitiatedLink with the received token
+  // Automatically trigger hipInitiatedLink with the received token.
   setImmediate(async () => {
     try {
+      // Pull EVERY PENDING context that just received this token, across all
+      // matching patient rows. Include the owning patient so each row is linked
+      // under its own HIP referenceNumber / hospital (duplicates of the same
+      // ABHA are still distinct HIP patient references).
       const contexts = await prisma.careContext.findMany({
-        where: { patientId: patient.id, linkToken, linkStatus: 'PENDING' },
-        include: { encounter: { include: { appointment: { select: { id: true } } } } },
+        where: { patientId: { in: patientIds }, linkToken, linkStatus: 'PENDING' },
+        include: {
+          encounter: { include: { appointment: { select: { id: true } } } },
+          patient: { include: { abhaRecord: true } },
+        },
       });
 
       if (!contexts.length) {
-        logger.info('on-generate-token: no PENDING contexts to link', { patientId: patient.id });
+        logger.info('on-generate-token: no PENDING contexts to link', { matchedPatientIds: patientIds });
         return;
       }
 
       const hipService = (await import('../hip/hip.service')).default;
-      const patientRef = patient.uhid || patient.id;
-      const patientName = `${patient.firstName} ${patient.lastName}`.trim();
-      const resolvedAbhaNumber = patient.abhaRecord?.abhaNumber || patient.abhaNumber
-        || (patient.abhaId || '').replace(/-/g, '');
-      const resolvedAbhaAddress = patient.abhaRecord?.abhaAddress || patient.abhaAddress
-        || abhaAddress || `${(patient.abhaId || '').replace(/-/g, '')}@sbx`;
 
-      // Group by derived hiType so the CM gets one block per type.
-      const blocks = await hipService.groupCareContextsByHiType(contexts);
-
-      // Resolve the tenant hospital from the patient's hospitalId. The link
-      // token + on-generate-token callback are scoped to the originating HIP,
-      // so the linked contexts must be advertised under the same hipId.
-      if (!patient.hospitalId) {
-        logger.warn('on-generate-token: patient has no hospitalId — refusing to fall back to platform hipId for linking', {
-          patientId: patient.id,
-        });
-        return;
+      // Group contexts by the local patient row that owns them, then link each
+      // row's contexts separately so the correct hipId + referenceNumber is used.
+      const byPatient = new Map<string, typeof contexts>();
+      for (const c of contexts) {
+        const arr = byPatient.get(c.patientId) || [];
+        arr.push(c);
+        byPatient.set(c.patientId, arr);
       }
-      await hipService.hipInitiatedLink({
-        abhaNumber:  resolvedAbhaNumber,
-        abhaAddress: resolvedAbhaAddress,
-        linkToken,
-        patient: blocks.map(b => ({
-          referenceNumber: patientRef,
-          display: patientName,
-          careContexts: b.careContexts,
-          hiType: b.hiType,
-          count: b.count,
-        })),
-      }, patient.hospitalId);
 
-      logger.info('on-generate-token: hipInitiatedLink submitted', {
-        patientId: patient.id,
-        count: contexts.length,
-        hiTypeBreakdown: blocks.map(b => ({ hiType: b.hiType, count: b.count })),
-      });
+      for (const [pid, pContexts] of byPatient) {
+        const p = pContexts[0].patient;
+        if (!p) continue;
+
+        // The link token + on-generate-token callback are scoped to the
+        // originating HIP, so the linked contexts must be advertised under the
+        // same hipId — refuse to fall back to the platform default.
+        if (!p.hospitalId) {
+          logger.warn('on-generate-token: patient has no hospitalId — refusing to fall back to platform hipId for linking', {
+            patientId: pid,
+          });
+          continue;
+        }
+
+        const patientRef = p.uhid || p.id;
+        const patientName = `${p.firstName} ${p.lastName}`.trim();
+        const resolvedAbhaNumber = p.abhaRecord?.abhaNumber || p.abhaNumber
+          || (p.abhaId || '').replace(/-/g, '');
+        const resolvedAbhaAddress = p.abhaRecord?.abhaAddress || p.abhaAddress
+          || abhaAddress || `${(p.abhaId || '').replace(/-/g, '')}@sbx`;
+
+        // Group by derived hiType so the CM gets one block per type.
+        const blocks = await hipService.groupCareContextsByHiType(pContexts);
+
+        try {
+          await hipService.hipInitiatedLink({
+            abhaNumber:  resolvedAbhaNumber,
+            abhaAddress: resolvedAbhaAddress,
+            linkToken,
+            patient: blocks.map(b => ({
+              referenceNumber: patientRef,
+              display: patientName,
+              careContexts: b.careContexts,
+              hiType: b.hiType,
+              count: b.count,
+            })),
+          }, p.hospitalId);
+
+          logger.info('on-generate-token: hipInitiatedLink submitted', {
+            patientId: pid,
+            count: pContexts.length,
+            hiTypeBreakdown: blocks.map(b => ({ hiType: b.hiType, count: b.count })),
+          });
+        } catch (e: any) {
+          logger.warn('on-generate-token: hipInitiatedLink failed for patient row', {
+            patientId: pid,
+            message: e?.message,
+          });
+        }
+      }
     } catch (e: any) {
       logger.warn('on-generate-token: hipInitiatedLink failed', { message: e?.message });
     }

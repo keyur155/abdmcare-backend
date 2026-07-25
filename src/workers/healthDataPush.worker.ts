@@ -128,16 +128,26 @@ async function processHealthDataPush(job: Job<HealthDataPushJobData>): Promise<v
     // "never serve another hospital's data" invariant STILL holds: we only
     // ever return care contexts this tenant owns. We're only broadening the
     // patient-row match to sibling rows of the same national ABHA identifier.
+    // DEFENSE-IN-DEPTH: broadening the patient match to ABHA-sibling rows (which
+    // may live at OTHER hospitals) is ONLY safe because the care-context query
+    // below filters `hipId = tenantHipId`, so we still return exclusively this
+    // tenant's contexts. If tenantHipId is absent that filter drops — so we MUST
+    // NOT broaden to siblings, or we'd return another hospital's contexts. Tie
+    // the two together: only reconcile across ABHA siblings when a tenant hipId
+    // is present to scope them. Without it, stay strictly on the consent patient.
     const cp: any = consent.patient;
-    const abhaOr: any[] = [];
-    if (cp?.abhaNumber) abhaOr.push({ abhaNumber: cp.abhaNumber });
-    if (cp?.abhaAddress) abhaOr.push({ abhaAddress: cp.abhaAddress });
-    if (cp?.abhaId) abhaOr.push({ abhaId: cp.abhaId });
-    if (cp?.abhaRecord?.abhaNumber) abhaOr.push({ abhaRecord: { abhaNumber: cp.abhaRecord.abhaNumber } });
-    if (cp?.abhaRecord?.abhaAddress) abhaOr.push({ abhaRecord: { abhaAddress: cp.abhaRecord.abhaAddress } });
-    const abhaSiblingIds = abhaOr.length
-      ? (await prisma.patient.findMany({ where: { OR: abhaOr }, select: { id: true } })).map((p) => p.id)
-      : [];
+    let abhaSiblingIds: string[] = [];
+    if (tenantHipId) {
+      const abhaOr: any[] = [];
+      if (cp?.abhaNumber) abhaOr.push({ abhaNumber: cp.abhaNumber });
+      if (cp?.abhaAddress) abhaOr.push({ abhaAddress: cp.abhaAddress });
+      if (cp?.abhaId) abhaOr.push({ abhaId: cp.abhaId });
+      if (cp?.abhaRecord?.abhaNumber) abhaOr.push({ abhaRecord: { abhaNumber: cp.abhaRecord.abhaNumber } });
+      if (cp?.abhaRecord?.abhaAddress) abhaOr.push({ abhaRecord: { abhaAddress: cp.abhaRecord.abhaAddress } });
+      abhaSiblingIds = abhaOr.length
+        ? (await prisma.patient.findMany({ where: { OR: abhaOr }, select: { id: true } })).map((p) => p.id)
+        : [];
+    }
     const candidatePatientIds = Array.from(new Set([consentPatientId, ...abhaSiblingIds]));
     if (candidatePatientIds.length > 1) {
       logger.info('Worker: reconciled ABHA across patient rows for care-context lookup', {
