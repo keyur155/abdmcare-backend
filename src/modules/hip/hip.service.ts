@@ -1156,9 +1156,18 @@ export class HipService {
    */
   async handleHealthInformationRequest(request: HealthInformationRequest) {
     try {
+      // DECISIVE: this line firing at all proves ABDM's CM DID dispatch the
+      // data-request to OUR HIP (rules out "external-HIP-only" / Case B). It
+      // also captures the exact abdmConsentId the HIU is asking for, so we can
+      // correlate it against the artefacts we recorded on the HIP side and spot
+      // an abdmConsentId mismatch.
       logger.info('HIP: Health information request', {
         transactionId: request.transactionId,
         inboundHipId: request.inboundHipId,
+        requestedConsentId: request.hiRequest?.consent?.id,
+        requestId: request.requestId,
+        dataPushUrl: request.hiRequest?.dataPushUrl,
+        requestedDateRange: request.hiRequest?.dateRange,
       });
 
       // Resolve the tenant hospital for this fulfill request. Strategy:
@@ -1182,6 +1191,22 @@ export class HipService {
       });
 
       if (!consent) {
+        // DECISIVE: the HIU requested data for this abdmConsentId but we hold no
+        // matching artefact. Dump the artefacts we DO have so we can tell a
+        // collision-drop / abdmConsentId-mismatch (Case A) from a consent that
+        // was genuinely never routed to us.
+        const recentGrantedArtefacts = await prisma.consent.findMany({
+          where: { status: 'GRANTED' as any },
+          orderBy: { grantedAt: 'desc' },
+          take: 10,
+          select: { consentId: true, abdmConsentId: true, patientId: true, grantedAt: true },
+        });
+        logger.warn('HIP: Health information request — CONSENT ARTEFACT NOT FOUND', {
+          transactionId: request.transactionId,
+          requestedConsentId: request.hiRequest?.consent?.id,
+          inboundHipId: request.inboundHipId,
+          recentGrantedArtefacts,
+        });
         throw new AppError('Consent artefact not found', 403);
       }
       if (consent.status !== 'GRANTED') {
@@ -1292,6 +1317,31 @@ export class HipService {
       const authorisedCareContextRefs: string[] = (artefactBody?.careContexts || [])
         .map((c) => c?.careContextReference)
         .filter((s): s is string => !!s);
+
+      // DECISIVE: do we actually HOLD any of the authorised care contexts under
+      // this tenant hipId? If localMatchedCount is 0 the consent points at data
+      // that lives at ANOTHER facility — we will accept (202) and enqueue but the
+      // worker's artefact-authorised filter drops every entry, so the HIU gets
+      // nothing. This is the single line that separates "we don't own the data"
+      // from "we own it but the push/encryption failed".
+      const localCareContexts = await prisma.careContext.findMany({
+        where: {
+          hipId: tenant.hipId,
+          ...(authorisedCareContextRefs.length
+            ? { careContextId: { in: authorisedCareContextRefs } }
+            : { patientId: consent.patientId }),
+        },
+        select: { careContextId: true, linkStatus: true, patientId: true, hipId: true },
+      });
+      logger.info('HIP: Health information request — local care context resolution', {
+        transactionId: request.transactionId,
+        tenantHipId: tenant.hipId,
+        consentPatientId: consent.patientId,
+        authorisedCareContextCount: authorisedCareContextRefs.length,
+        authorisedCareContextRefs,
+        localMatchedCount: localCareContexts.length,
+        localMatched: localCareContexts,
+      });
 
       // Enqueue the data push job — return 202 immediately so ABDM doesn't timeout
       const jobData: HealthDataPushJobData = {

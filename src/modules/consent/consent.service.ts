@@ -324,9 +324,18 @@ export class ConsentService {
           });
           logger.info('HIP: consent artefact recorded', {
             consentId: consent.consentId,
+            abdmConsentId,
             status,
             promoted: promote,
             careContextCount: Array.isArray(consentDetail?.careContexts) ? consentDetail.careContexts.length : 0,
+            // DECISIVE: which hipId owns this artefact's care contexts and the
+            // exact references. Compare artefactHipId against OUR tenant hipId
+            // to tell whether the follow-up /health-information/request will
+            // route to us (Case A) or to an external facility (Case B).
+            artefactHipId: consentDetail?.hip?.id,
+            careContextRefs: (Array.isArray(consentDetail?.careContexts) ? consentDetail.careContexts : [])
+              .map((c: any) => c?.careContextReference)
+              .filter(Boolean),
           });
         } else if (status === 'GRANTED' && resolvedPatientId) {
           // No local Consent row exists for this artefact — this is the
@@ -369,7 +378,14 @@ export class ConsentService {
 
             const created = await prisma.consent.create({
               data: {
-                consentId: `CR-${Date.now()}`,
+                // Collision-safe id. Multiple HIP consent notifications for the
+                // same patient arrive in the SAME millisecond (one artefact per
+                // facility holding data), so `CR-${Date.now()}` alone duplicates
+                // and the create() throws a unique-constraint on `consentId` —
+                // silently dropping that facility's artefact, which later 403s
+                // the /health-information/request ("Consent artefact not found")
+                // and is why only some facilities' records pull.
+                consentId: `CR-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
                 patientId: resolvedPatientId,
                 requesterId,
                 requesterName,
@@ -389,10 +405,18 @@ export class ConsentService {
             });
             logger.info('HIP: consent artefact recorded', {
               consentId: created.consentId,
+              abdmConsentId,
               status: 'GRANTED',
               promoted: false,
               created: true,
               careContextCount: Array.isArray(consentDetail?.careContexts) ? consentDetail.careContexts.length : 0,
+              // DECISIVE: artefact ownership (see sibling branch). If artefactHipId
+              // != our tenant hipId, the data lives at another facility and the
+              // HIU pull will get nothing from us.
+              artefactHipId: consentDetail?.hip?.id,
+              careContextRefs: (Array.isArray(consentDetail?.careContexts) ? consentDetail.careContexts : [])
+                .map((c: any) => c?.careContextReference)
+                .filter(Boolean),
             });
           } catch (createErr: any) {
             logger.error('HIP: failed to insert HIU-initiated consent artefact', {
