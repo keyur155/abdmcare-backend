@@ -142,6 +142,22 @@ export async function resolveHiuTenant(hospitalId: string): Promise<HospitalAbdm
 }
 
 /**
+ * Build the `doneAt` timestamp for data-flow notifications. The ABDM gateway
+ * validates `doneAt` as "present or past date time" and rejects anything in the
+ * future with `ABDM-9999: Done At should be present or past date time` (HTTP
+ * 400). When our host clock runs even slightly ahead of the gateway's, a plain
+ * `new Date().toISOString()` reads as future and the notify fails — which in
+ * turn makes the push worker mark the transfer FAILED and retry, re-pushing the
+ * same page after the HIU keypair was already consumed. Skew the timestamp a
+ * few seconds into the past to absorb this; it is still an accurate "just now"
+ * completion time and always satisfies the "present or past" constraint.
+ */
+export function abdmDoneAt(): string {
+  const SKEW_BUFFER_MS = 60_000;
+  return new Date(Date.now() - SKEW_BUFFER_MS).toISOString();
+}
+
+/**
  * Reverse lookup — given an inbound `metaData.hipId` / `X-HIP-ID` from an
  * ABDM callback, return the hospital tenant whose row owns that HIP ID.
  *

@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import prisma from '../../common/config/database';
-import abdmClient, { resolveHiuTenant } from '../../common/utils/abdm-client';
+import abdmClient, { resolveHiuTenant, abdmDoneAt } from '../../common/utils/abdm-client';
 import { abdmConfig } from '../../common/config/abdm';
 import { AppError } from '../../common/middleware/errorHandler';
 import logger from '../../common/config/logger';
@@ -368,7 +368,7 @@ export class HiuService {
           notification: {
             consentId: params.consentId,
             transactionId: params.transactionId,
-            doneAt: new Date().toISOString(),
+            doneAt: abdmDoneAt(),
             notifier: { type: 'HIU', id: notifierHiuId },
             statusNotification: {
               sessionStatus: params.status,

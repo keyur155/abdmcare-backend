@@ -3,7 +3,7 @@ import fs from 'fs';
 import prisma from '../common/config/database';
 import logger from '../common/config/logger';
 import { abdmConfig } from '../common/config/abdm';
-import { AbdmClient, resolveHipTenant } from '../common/utils/abdm-client';
+import { AbdmClient, resolveHipTenant, abdmDoneAt } from '../common/utils/abdm-client';
 import EncryptionService from '../common/utils/encryption';
 import crypto from 'crypto';
 import { HealthDataPushJobData, createHealthDataPushWorker, logHealthDataPushQueueCounts } from '../common/config/queue';
@@ -718,7 +718,7 @@ async function processHealthDataPush(job: Job<HealthDataPushJobData>): Promise<v
         notification: {
           consentId: consentAbdmId,
           transactionId,
-          doneAt: new Date().toISOString(),
+          doneAt: abdmDoneAt(),
           notifier: { type: 'HIP', id: notifyHipId },
           statusNotification: { sessionStatus: 'TRANSFERRED', hipId: notifyHipId, statusResponses },
         },
@@ -780,7 +780,7 @@ async function processHealthDataPush(job: Job<HealthDataPushJobData>): Promise<v
               notification: {
                 consentId: consentAbdmId,
                 transactionId,
-                doneAt: new Date().toISOString(),
+                doneAt: abdmDoneAt(),
                 notifier: { type: 'HIP', id: failHipId },
                 statusNotification: {
                   sessionStatus: 'FAILED',
