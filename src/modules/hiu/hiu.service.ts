@@ -186,13 +186,13 @@ export class HiuService {
         tenant,
       );
 
-      // Diagnostic: confirm BOTH DH key fields go out in their canonical form —
-      // keyValue as the raw 65-byte point (0x04…) and x509PublicKey as SPKI DER
-      // (0x30…). Per the M3 sample the CM/HIP reads x509PublicKey to import our
-      // key; if keyValueEncoding ever shows 'spki-der' we regressed to sending
-      // SPKI-in-keyValue, which strict HIPs mis-parse.
-      const outReqRaw = Buffer.from(ecdhKeyPair.publicKey, 'base64');
-      const outReqSpki = Buffer.from(ecdhKeyPair.x509PublicKey || ecdhKeyPair.publicKey, 'base64');
+      // Diagnostic: log the encoding of the field we ACTUALLY send as
+      // dhPublicKey.keyValue (now the SPKI DER, per the Fidelius X509EncodedKeySpec
+      // requirement — see the payload above). Previously this classified the raw
+      // `publicKey` variable regardless of the payload, so it always printed
+      // 'raw-uncompressed' and falsely looked like the SPKI fix hadn't deployed.
+      const outReqKeyValue = Buffer.from(ecdhKeyPair.x509PublicKey || ecdhKeyPair.publicKey, 'base64');
+      const outReqRawPoint = Buffer.from(ecdhKeyPair.publicKey, 'base64');
       const classify = (b: Buffer) => b[0] === 0x30 ? 'spki-der'
         : (b.length === 65 && b[0] === 0x04) ? 'raw-uncompressed' : 'unknown';
       logger.info('HIU: Health information request sent', {
@@ -202,10 +202,11 @@ export class HiuService {
         hiuId: tenant.hiuId,
         hospitalId: tenant.hospitalId,
         dateRange: { from: dateRangeFrom, to: dateRangeTo },
-        keyValueEncoding: classify(outReqRaw),
-        keyValueBytesLength: outReqRaw.length,
-        x509Encoding: classify(outReqSpki),
-        x509BytesLength: outReqSpki.length,
+        keyValueEncoding: classify(outReqKeyValue),
+        keyValueBytesLength: outReqKeyValue.length,
+        rawPointBytesLength: outReqRawPoint.length,
+        x509Encoding: classify(outReqKeyValue),
+        x509BytesLength: outReqKeyValue.length,
       });
       return { success: true, message: 'Health information request sent successfully' };
     } catch (error: any) {
