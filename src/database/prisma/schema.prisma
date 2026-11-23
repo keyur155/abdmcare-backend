@@ -68,6 +68,11 @@ model Patient {
   externalHealthRecords   ExternalHealthRecord[]
   immunizations           Immunization[]
   
+  // nhcx
+  insurancePolicies InsurancePolicy[]
+  nhcxPreAuths      NHCXPreAuth[]
+  nhcxClaims        NHCXClaim[]
+  
   createdAt        DateTime      @default(now())
   updatedAt        DateTime      @updatedAt
   
@@ -777,6 +782,13 @@ model Hospital {
   medicines    Medicine[]
   inventoryBatches InventoryBatch[]
   consentsRequested Consent[] @relation("RequesterHospital")
+
+  // nhcx Relations
+  nhcxEnabled       Boolean @default(false)
+  nhcxParticipants  NHCXParticipant[]
+  insurancePolicies InsurancePolicy[]
+  nhcxPreAuths      NHCXPreAuth[]
+  nhcxClaims        NHCXClaim[]
   
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -1254,6 +1266,10 @@ model Admission {
   rounds           Encounter[]     @relation("IPDRounds")
   transfers        BedTransfer[]
 
+  //nhcx preauth and insurence claims
+  nhcxPreAuths NHCXPreAuth[]
+  nhcxClaims   NHCXClaim[]
+
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
 
@@ -1615,3 +1631,346 @@ model Document {
   @@index([admissionId])
   @@map("documents")
 }
+
+// nhcx model 
+
+
+enum NHCXScheme {
+  IRDAI
+  PMJAY
+}
+
+enum NHCXParticipantStatus {
+  NOT_REGISTERED
+  PENDING
+  ACTIVE
+  SUSPENDED
+  FAILED
+}
+
+enum NHCXTransactionStatus {
+  CREATED
+  SENT
+  ACKNOWLEDGED
+  PROCESSING
+  SUCCESS
+  FAILED
+  TIMEOUT
+}
+
+enum NHCXTransactionDirection {
+  OUTBOUND
+  INBOUND
+}
+
+enum NHCXPreAuthStatus {
+  DRAFT
+  SUBMITTED
+  ACKNOWLEDGED
+  APPROVED
+  PARTIALLY_APPROVED
+  QUERIED
+  DENIED
+  CANCELLED
+  EXPIRED
+}
+
+enum NHCXClaimStatus {
+  DRAFT
+  SUBMITTED
+  ACKNOWLEDGED
+  PROCESSING
+  QUERIED
+  APPROVED
+  PARTIALLY_APPROVED
+  DENIED
+  PAID
+  CANCELLED
+}
+
+enum InsurancePolicyStatus {
+  ACTIVE
+  INACTIVE
+  EXPIRED
+  CANCELLED
+  UNKNOWN
+}
+
+
+model NHCXParticipant {
+  id              String @id @default(uuid())
+
+  hospitalId      String
+  hospital        Hospital @relation(
+    fields: [hospitalId],
+    references: [id]
+  )
+
+  participantId   String @unique
+  participantName String
+
+  status          NHCXParticipantStatus
+                    @default(NOT_REGISTERED)
+
+  callbackUrl     String?
+
+  registeredAt    DateTime?
+  lastVerifiedAt  DateTime?
+
+  certificates    NHCXCertificate[]
+  transactions    NHCXTransaction[]
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([hospitalId])
+  @@map("nhcx_participants")
+}
+
+model NHCXCertificate {
+  id              String @id @default(uuid())
+
+  participantId   String
+  participant    NHCXParticipant @relation(
+    fields: [participantId],
+    references: [id]
+  )
+
+  certificateId   String?
+  certificateType String?
+  publicKey       String
+
+  validFrom       DateTime?
+  validUntil      DateTime?
+  isActive        Boolean @default(true)
+
+  createdAt       DateTime @default(now())
+
+  @@index([participantId])
+  @@map("nhcx_certificates")
+}
+
+
+model InsurancePolicy {
+  id              String @id @default(uuid())
+
+  patientId       String
+  patient         Patient @relation(
+    fields: [patientId],
+    references: [id]
+  )
+
+  hospitalId      String
+  hospital        Hospital @relation(
+    fields: [hospitalId],
+    references: [id]
+  )
+
+  scheme          NHCXScheme
+
+  payerId         String?
+  payerName       String?
+
+  policyNumber    String?
+  memberId        String?
+  beneficiaryId   String?
+
+  policyName      String?
+  coverageAmount Decimal? @db.Decimal(12, 2)
+  availableAmount Decimal? @db.Decimal(12, 2)
+
+  validFrom       DateTime?
+  validUntil      DateTime?
+
+  status          InsurancePolicyStatus
+                    @default(UNKNOWN)
+
+  rawResponse     Json?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  preAuths        NHCXPreAuth[]
+  claims          NHCXClaim[]
+
+  @@index([patientId, hospitalId])
+  @@index([policyNumber])
+  @@index([memberId])
+  @@map("insurance_policies")
+}
+
+
+model NHCXPreAuth {
+  id              String @id @default(uuid())
+
+  hospitalId      String
+  patientId       String
+  admissionId     String?
+  policyId        String
+
+  hospital        Hospital @relation(
+    fields: [hospitalId],
+    references: [id]
+  )
+
+  patient         Patient @relation(
+    fields: [patientId],
+    references: [id]
+  )
+
+  admission       Admission? @relation(
+    fields: [admissionId],
+    references: [id]
+  )
+
+  policy          InsurancePolicy @relation(
+    fields: [policyId],
+    references: [id]
+  )
+
+  preAuthNumber   String? @unique
+
+  requestedAmount Decimal @db.Decimal(12, 2)
+  approvedAmount  Decimal? @db.Decimal(12, 2)
+
+  diagnosis       Json?
+  treatmentDetails Json?
+
+  status          NHCXPreAuthStatus @default(DRAFT)
+
+  submittedAt     DateTime?
+  respondedAt     DateTime?
+
+  payerReference  String?
+  responseData    Json?
+
+  claims          NHCXClaim[]
+  transactions    NHCXTransaction[]
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([hospitalId, status])
+  @@index([patientId])
+  @@index([admissionId])
+  @@map("nhcx_preauths")
+}
+
+
+model NHCXClaim {
+  id              String @id @default(uuid())
+
+  hospitalId      String
+  patientId       String
+  admissionId     String?
+  policyId        String
+  preAuthId       String?
+
+  hospital        Hospital @relation(
+    fields: [hospitalId],
+    references: [id]
+  )
+
+  patient         Patient @relation(
+    fields: [patientId],
+    references: [id]
+  )
+
+  admission       Admission? @relation(
+    fields: [admissionId],
+    references: [id]
+  )
+
+  policy          InsurancePolicy @relation(
+    fields: [policyId],
+    references: [id]
+  )
+
+  preAuth         NHCXPreAuth? @relation(
+    fields: [preAuthId],
+    references: [id]
+  )
+
+  claimNumber     String? @unique
+
+  requestedAmount Decimal @db.Decimal(12, 2)
+  approvedAmount  Decimal? @db.Decimal(12, 2)
+  paidAmount      Decimal? @db.Decimal(12, 2)
+
+  status          NHCXClaimStatus @default(DRAFT)
+
+  submittedAt     DateTime?
+  respondedAt     DateTime?
+  settledAt       DateTime?
+
+  payerReference  String?
+  responseData    Json?
+
+  transactions    NHCXTransaction[]
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([hospitalId, status])
+  @@index([patientId])
+  @@index([admissionId])
+  @@map("nhcx_claims")
+}
+
+
+model NHCXTransaction {
+  id              String @id @default(uuid())
+
+  participantId   String
+  participant     NHCXParticipant @relation(
+    fields: [participantId],
+    references: [id]
+  )
+
+  preAuthId       String?
+  preAuth         NHCXPreAuth? @relation(
+    fields: [preAuthId],
+    references: [id]
+  )
+
+  claimId         String?
+  claim           NHCXClaim? @relation(
+    fields: [claimId],
+    references: [id]
+  )
+
+  requestId       String?
+  correlationId   String?
+  transactionId   String?
+  apiCallId       String?
+
+  useCase         String
+  workflowCode    String?
+  endpoint        String
+
+  direction       NHCXTransactionDirection
+  status          NHCXTransactionStatus
+                    @default(CREATED)
+
+  requestPayload  Json?
+  responsePayload Json?
+
+  httpStatus      Int?
+  errorCode       String?
+  errorMessage    String?
+
+  sentAt          DateTime?
+  completedAt     DateTime?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([requestId])
+  @@index([correlationId])
+  @@index([transactionId])
+  @@index([apiCallId])
+  @@index([participantId, status])
+  @@index([createdAt])
+  @@map("nhcx_transactions")
+}
+

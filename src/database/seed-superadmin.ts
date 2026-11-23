@@ -9,7 +9,7 @@
  *
  *   superadmin@abhaayushman.com / Admin@123
  */
-
+import 'dotenv/config';
 import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 
