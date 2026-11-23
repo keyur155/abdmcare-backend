@@ -1701,16 +1701,12 @@ model NHCXParticipant {
   id              String @id @default(uuid())
 
   hospitalId      String
-  hospital        Hospital @relation(
-    fields: [hospitalId],
-    references: [id]
-  )
+  hospital        Hospital @relation(fields: [hospitalId], references: [id])
 
   participantId   String @unique
   participantName String
 
-  status          NHCXParticipantStatus
-                    @default(NOT_REGISTERED)
+  status          NHCXParticipantStatus @default(NOT_REGISTERED)
 
   callbackUrl     String?
 
@@ -1731,11 +1727,7 @@ model NHCXCertificate {
   id              String @id @default(uuid())
 
   participantId   String
-  participant    NHCXParticipant @relation(
-    fields: [participantId],
-    references: [id]
-  )
-
+  participant    NHCXParticipant @relation(fields: [participantId],references: [id])
   certificateId   String?
   certificateType String?
   publicKey       String
@@ -1755,19 +1747,12 @@ model InsurancePolicy {
   id              String @id @default(uuid())
 
   patientId       String
-  patient         Patient @relation(
-    fields: [patientId],
-    references: [id]
-  )
+  patient         Patient @relation( fields: [patientId], references: [id])
 
   hospitalId      String
-  hospital        Hospital @relation(
-    fields: [hospitalId],
-    references: [id]
-  )
+  hospital        Hospital @relation( fields: [hospitalId], references: [id] )
 
   scheme          NHCXScheme
-
   payerId         String?
   payerName       String?
 
@@ -1782,8 +1767,7 @@ model InsurancePolicy {
   validFrom       DateTime?
   validUntil      DateTime?
 
-  status          InsurancePolicyStatus
-                    @default(UNKNOWN)
+  status          InsurancePolicyStatus @default(UNKNOWN)
 
   rawResponse     Json?
 
@@ -1808,25 +1792,10 @@ model NHCXPreAuth {
   admissionId     String?
   policyId        String
 
-  hospital        Hospital @relation(
-    fields: [hospitalId],
-    references: [id]
-  )
-
-  patient         Patient @relation(
-    fields: [patientId],
-    references: [id]
-  )
-
-  admission       Admission? @relation(
-    fields: [admissionId],
-    references: [id]
-  )
-
-  policy          InsurancePolicy @relation(
-    fields: [policyId],
-    references: [id]
-  )
+  hospital        Hospital @relation( fields: [hospitalId], references:[id])
+  patient         Patient @relation(fields: [patientId],references:[id])
+  admission       Admission? @relation( fields: [admissionId], references:[id])
+  policy          InsurancePolicy @relation( fields: [policyId], references:[id] )
 
   preAuthNumber   String? @unique
 
@@ -1866,30 +1835,15 @@ model NHCXClaim {
   policyId        String
   preAuthId       String?
 
-  hospital        Hospital @relation(
-    fields: [hospitalId],
-    references: [id]
-  )
+  hospital        Hospital @relation(fields: [hospitalId],references: [id])
 
-  patient         Patient @relation(
-    fields: [patientId],
-    references: [id]
-  )
+  patient         Patient @relation( fields: [patientId], references: [id])
 
-  admission       Admission? @relation(
-    fields: [admissionId],
-    references: [id]
-  )
+  admission       Admission? @relation( fields: [admissionId],references: [id])
 
-  policy          InsurancePolicy @relation(
-    fields: [policyId],
-    references: [id]
-  )
+  policy          InsurancePolicy @relation(fields: [policyId],references: [id])
 
-  preAuth         NHCXPreAuth? @relation(
-    fields: [preAuthId],
-    references: [id]
-  )
+  preAuth         NHCXPreAuth? @relation(fields: [preAuthId],references: [id])
 
   claimNumber     String? @unique
 
@@ -1922,22 +1876,13 @@ model NHCXTransaction {
   id              String @id @default(uuid())
 
   participantId   String
-  participant     NHCXParticipant @relation(
-    fields: [participantId],
-    references: [id]
-  )
+  participant     NHCXParticipant @relation(fields: [participantId],references: [id])
 
   preAuthId       String?
-  preAuth         NHCXPreAuth? @relation(
-    fields: [preAuthId],
-    references: [id]
-  )
+  preAuth         NHCXPreAuth? @relation(fields: [preAuthId],references: [id])
 
   claimId         String?
-  claim           NHCXClaim? @relation(
-    fields: [claimId],
-    references: [id]
-  )
+  claim           NHCXClaim? @relation(fields: [claimId],references: [id])
 
   requestId       String?
   correlationId   String?
@@ -1949,8 +1894,7 @@ model NHCXTransaction {
   endpoint        String
 
   direction       NHCXTransactionDirection
-  status          NHCXTransactionStatus
-                    @default(CREATED)
+  status          NHCXTransactionStatus @default(CREATED)
 
   requestPayload  Json?
   responsePayload Json?
